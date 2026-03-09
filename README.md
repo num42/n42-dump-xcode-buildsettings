@@ -1,20 +1,22 @@
 # n42-dump-xcode-buildsettings
 
-CLI tool to dump `xcodebuild` build settings, sanitize volatile values, and persist one JSON file per target for stable Git diffs.
+CLI tool to dump `xcodebuild` build settings, sanitize volatile values, and write one JSON file per target for stable Git diffs.
 
 ## What it does
 
 The tool runs:
 
 ```bash
-xcodebuild -alltargets -showBuildSettings -json
+xcrun xcodebuild -alltargets -showBuildSettings -json
 ```
 
 Then it:
 
 1. Sanitizes the full JSON dump in memory
 2. Splits by `buildSettings.TARGET_NAME`
-3. Writes one file per target: `PersistedLogs/buildConfigs/<TARGET_NAME>.json`
+3. Writes one file per target: `<output-dir>/<TARGET_NAME>.json`
+
+Default output dir: `PersistedLogs/buildConfigs`
 
 ## Sanitization
 
@@ -22,8 +24,6 @@ The dump is normalized to reduce machine- and build-specific noise.
 
 ### Regex-based replacements
 
-- Build version timestamps like `2026.03.09.12.34` -> `XXXX.XX.XX.XX.XX`
-- `"N42_GIT_COMMIT_HASH" : "1A2B3C4D"` -> `"N42_GIT_COMMIT_HASH" : "XXXXXXXX"`
 - Paths under `/var/folders/.../.../` -> `/var/folders/XX/XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/`
 
 ### Key-specific replacements
@@ -32,7 +32,18 @@ The dump is normalized to reduce machine- and build-specific noise.
 - `MAC_OS_X_VERSION_ACTUAL` -> `XXXX`
 - `MAC_OS_X_VERSION_MAJOR` -> `XX`
 - `MAC_OS_X_VERSION_MINOR` -> `XX`
+- `BUILD_VERSION` -> `XXXX.XX.XX.XX.XX`
 - `PATH` -> `REDACTED_PATH`
+
+### Optional user-defined redactions
+
+Use `--redact-field <KEY>` (repeatable) to redact additional keys with value `REDACTED`.
+
+`N42_GIT_COMMIT_HASH` is not redacted by default; include it explicitly if needed:
+
+```bash
+swift run n42-dump-xcode-buildsettings --redact-field N42_GIT_COMMIT_HASH
+```
 
 ## Usage
 
@@ -42,10 +53,36 @@ The dump is normalized to reduce machine- and build-specific noise.
 swift run n42-dump-xcode-buildsettings
 ```
 
+Run from another repo:
+
+```bash
+swift run --package-path /Users/admin/dev/work/Tools/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings
+```
+
 Custom output directory (derived from parent directory of the provided path):
 
 ```bash
 swift run n42-dump-xcode-buildsettings --all-targets-output /tmp/allTargets.json
+```
+
+Note: the `--all-targets-output` filename is not written. Only its parent directory is used for per-target files.
+
+With additional redacted fields:
+
+```bash
+swift run n42-dump-xcode-buildsettings --redact-field N42_GIT_COMMIT_HASH --redact-field CUSTOM_SECRET
+```
+
+With verbose logging:
+
+```bash
+swift run n42-dump-xcode-buildsettings --verbose
+```
+
+Short form:
+
+```bash
+swift run n42-dump-xcode-buildsettings -v
 ```
 
 ### Mint
@@ -70,6 +107,24 @@ With custom output directory (derived from parent directory of the provided path
 
 ```bash
 mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings --all-targets-output /tmp/allTargets.json
+```
+
+With additional redacted fields:
+
+```bash
+mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings --redact-field N42_GIT_COMMIT_HASH --redact-field CUSTOM_SECRET
+```
+
+With verbose logging:
+
+```bash
+mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings --verbose
+```
+
+Short form:
+
+```bash
+mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings -v
 ```
 
 ## Requirements

@@ -19,9 +19,11 @@ struct n42_dump_xcode_buildsettings {
     }
 
     private static func printUsage() {
-        print("Usage: n42-dump-xcode-buildsettings [--all-targets-output <path>]")
+        print("Usage: n42-dump-xcode-buildsettings [--all-targets-output <path>] [--redact-field <KEY> ...] [--verbose]")
         print("Runs xcodebuild settings dump, sanitizes volatile values, and writes per-target JSON files.")
         print("No in-between all-targets file is written; the parent directory of --all-targets-output is used.")
+        print("Use --redact-field to redact additional build setting keys with value REDACTED.")
+        print("Use --verbose to print progress logs.")
         print("Default value: PersistedLogs/buildConfigs/allTargets.json")
     }
 }
@@ -29,21 +31,33 @@ struct n42_dump_xcode_buildsettings {
 enum BuildSettingsTool {
     struct Options {
         let allTargetsOutputURL: URL
+        let additionalRedactedFields: Set<String>
+        let verbose: Bool
 
         static let defaults = Options(
-            allTargetsOutputURL: URL(fileURLWithPath: "PersistedLogs/buildConfigs/allTargets.json")
+            allTargetsOutputURL: URL(fileURLWithPath: "PersistedLogs/buildConfigs/allTargets.json"),
+            additionalRedactedFields: [],
+            verbose: false
         )
+    }
+
+    struct Logger {
+        let isVerbose: Bool
+
+        func log(_ message: String) {
+            guard isVerbose else { return }
+            fputs("[n42-dump] \(message)\n", stderr)
+        }
     }
 
     static let xcodebuildCommand: [String] = ["xcodebuild", "-alltargets", "-showBuildSettings", "-json"]
 
     static let regexReplacements: [(pattern: String, replacement: String)] = [
-        (#"[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{2}\.[0-9]{2}"#, "XXXX.XX.XX.XX.XX"),
-        (#""N42_GIT_COMMIT_HASH"\s*:\s*"[A-F0-9]{8}""#, #""N42_GIT_COMMIT_HASH" : "XXXXXXXX""#),
         (#"/var/folders/[a-z0-9]*/[a-z0-9_]*/"#, "/var/folders/XX/XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/")
     ]
 
     static let quotedValueReplacements: [(key: String, replacement: String)] = [
+        ("BUILD_VERSION", "XXXX.XX.XX.XX.XX"),
         ("MAC_OS_X_PRODUCT_BUILD_VERSION", "XXXXXXXX"),
         ("MAC_OS_X_VERSION_ACTUAL", "XXXX"),
         ("MAC_OS_X_VERSION_MAJOR", "XX"),
@@ -54,6 +68,8 @@ enum BuildSettingsTool {
     static func parseOptions(arguments: [String]) throws -> Options {
         var index = 0
         var allTargetsOutputURL = Options.defaults.allTargetsOutputURL
+        var additionalRedactedFields = Set<String>()
+        var verbose = false
 
         while index < arguments.count {
             let argument = arguments[index]
@@ -64,46 +80,94 @@ enum BuildSettingsTool {
                     throw CLIError.invalidArguments("Missing value for --all-targets-output.")
                 }
                 allTargetsOutputURL = URL(fileURLWithPath: arguments[index])
+            case "--redact-field":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError.invalidArguments("Missing value for --redact-field.")
+                }
+                additionalRedactedFields.insert(arguments[index])
+            case "--verbose", "-v":
+                verbose = true
             default:
                 throw CLIError.invalidArguments("Unknown argument: \(argument)")
             }
             index += 1
         }
 
-        return Options(allTargetsOutputURL: allTargetsOutputURL)
+        return Options(
+            allTargetsOutputURL: allTargetsOutputURL,
+            additionalRedactedFields: additionalRedactedFields,
+            verbose: verbose
+        )
     }
 
     static func run(options: Options = .defaults, fileManager: FileManager = .default) throws {
         let outputDirectory = options.allTargetsOutputURL.deletingLastPathComponent()
+        let logger = Logger(isVerbose: options.verbose)
+
+        logger.log("Preparing output directory: \(outputDirectory.path)")
 
         try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
 
-        let rawBuildSettings = try runCommand(executable: "/usr/bin/xcrun", arguments: xcodebuildCommand)
-        let sanitizedBuildSettings = sanitize(rawBuildSettings)
+        logger.log("Running command: /usr/bin/xcrun \(xcodebuildCommand.joined(separator: " "))")
+        let rawBuildSettings = try runCommand(
+            executable: "/usr/bin/xcrun",
+            arguments: xcodebuildCommand,
+            logger: logger
+        )
+        logger.log("Received \(rawBuildSettings.utf8.count) bytes of build settings JSON")
+
+        let sanitizedBuildSettings = sanitize(
+            rawBuildSettings,
+            additionalRedactedFields: options.additionalRedactedFields
+        )
+        logger.log("Sanitized JSON size: \(sanitizedBuildSettings.utf8.count) bytes")
+
         let entries = try parseEntries(fromJSONString: sanitizedBuildSettings)
+        logger.log("Parsed \(entries.count) build settings entries")
         try writePerTargetFiles(entries: entries, to: outputDirectory, fileManager: fileManager)
+        logger.log("Wrote \(targetBuckets(entries: entries).count) per-target JSON files")
     }
 
-    static func runCommand(executable: String, arguments: [String]) throws -> String {
+    static func runCommand(executable: String, arguments: [String], logger: Logger = Logger(isVerbose: false)) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
 
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
+        let fileManager = FileManager.default
+        let stdoutURL = fileManager.temporaryDirectory.appendingPathComponent("n42-dump-stdout-\(UUID().uuidString).tmp")
+        let stderrURL = fileManager.temporaryDirectory.appendingPathComponent("n42-dump-stderr-\(UUID().uuidString).tmp")
+        fileManager.createFile(atPath: stdoutURL.path, contents: nil)
+        fileManager.createFile(atPath: stderrURL.path, contents: nil)
+        defer {
+            try? fileManager.removeItem(at: stdoutURL)
+            try? fileManager.removeItem(at: stderrURL)
+        }
+
+        let stdoutHandle = try FileHandle(forWritingTo: stdoutURL)
+        let stderrHandle = try FileHandle(forWritingTo: stderrURL)
+        process.standardOutput = stdoutHandle
+        process.standardError = stderrHandle
 
         try process.run()
         process.waitUntilExit()
+        stdoutHandle.closeFile()
+        stderrHandle.closeFile()
 
-        let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
-        let errorData = stderr.fileHandleForReading.readDataToEndOfFile()
+        let outputData = try Data(contentsOf: stdoutURL)
+        let errorData = try Data(contentsOf: stderrURL)
+
+        if logger.isVerbose, !errorData.isEmpty, let stderrText = String(data: errorData, encoding: .utf8) {
+            logger.log("xcodebuild stderr output:\n\(stderrText)")
+        }
 
         guard process.terminationStatus == 0 else {
+            logger.log("xcodebuild exited with status \(process.terminationStatus)")
             let errorMessage = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
             throw CLIError.commandFailed(errorMessage?.isEmpty == false ? errorMessage! : "xcodebuild failed.")
         }
+
+        logger.log("xcodebuild completed successfully")
 
         guard let output = String(data: outputData, encoding: .utf8) else {
             throw CLIError.invalidUTF8
@@ -112,7 +176,7 @@ enum BuildSettingsTool {
         return output
     }
 
-    static func sanitize(_ input: String) -> String {
+    static func sanitize(_ input: String, additionalRedactedFields: Set<String> = []) -> String {
         var output = input
 
         for rule in regexReplacements {
@@ -120,6 +184,9 @@ enum BuildSettingsTool {
         }
         for rule in quotedValueReplacements {
             output = sanitizeQuotedValue(in: output, key: rule.key, replacement: rule.replacement)
+        }
+        for field in additionalRedactedFields.sorted() {
+            output = sanitizeQuotedValue(in: output, key: field, replacement: "REDACTED")
         }
 
         return output
@@ -143,60 +210,51 @@ enum BuildSettingsTool {
         )
     }
 
-    static func parseEntries(from url: URL) throws -> [BuildSettingsEntry] {
-        let data = try Data(contentsOf: url)
-        return try JSONDecoder().decode([BuildSettingsEntry].self, from: data)
-    }
-
-    static func parseEntries(fromJSONString jsonString: String) throws -> [BuildSettingsEntry] {
+    static func parseEntries(fromJSONString jsonString: String) throws -> [[String: Any]] {
         guard let data = jsonString.data(using: .utf8) else {
             throw CLIError.invalidUTF8
         }
-        return try JSONDecoder().decode([BuildSettingsEntry].self, from: data)
+
+        guard let jsonArray = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw CLIError.invalidJSONStructure
+        }
+        return jsonArray
     }
 
-    static func targetBuckets(entries: [BuildSettingsEntry]) -> [String: [BuildSettingsEntry]] {
-        entries.reduce(into: [String: [BuildSettingsEntry]]()) { partialResult, entry in
-            guard let targetName = entry.buildSettings.targetName else { return }
+    static func targetBuckets(entries: [[String: Any]]) -> [String: [[String: Any]]] {
+        entries.reduce(into: [String: [[String: Any]]]()) { partialResult, entry in
+            guard
+                let buildSettings = entry["buildSettings"] as? [String: Any],
+                let targetName = buildSettings["TARGET_NAME"] as? String
+            else {
+                return
+            }
             partialResult[targetName, default: []].append(entry)
         }
     }
 
     static func writePerTargetFiles(
-        entries: [BuildSettingsEntry],
+        entries: [[String: Any]],
         to outputDirectory: URL,
         fileManager: FileManager = .default
     ) throws {
         try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
 
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let buckets = targetBuckets(entries: entries)
 
         for targetName in buckets.keys.sorted() {
             guard let targetEntries = buckets[targetName] else { continue }
             let outputURL = outputDirectory.appendingPathComponent("\(targetName).json")
-            let encoded = try encoder.encode(targetEntries)
-            try encoded.write(to: outputURL)
+            let encoded = try JSONSerialization.data(withJSONObject: targetEntries, options: [.prettyPrinted, .sortedKeys])
+            try encoded.write(to: outputURL, options: .atomic)
         }
     }
-}
-
-struct BuildSettingsEntry: Codable {
-    let buildSettings: BuildSettings
-}
-
-struct BuildSettings: Codable {
-    enum CodingKeys: String, CodingKey {
-        case targetName = "TARGET_NAME"
-    }
-
-    let targetName: String?
 }
 
 enum CLIError: LocalizedError {
     case commandFailed(String)
     case invalidUTF8
+    case invalidJSONStructure
     case invalidArguments(String)
 
     var errorDescription: String? {
@@ -205,6 +263,8 @@ enum CLIError: LocalizedError {
             return message
         case .invalidUTF8:
             return "xcodebuild output is not valid UTF-8."
+        case .invalidJSONStructure:
+            return "xcodebuild output JSON has an unexpected structure."
         case let .invalidArguments(message):
             return message
         }
