@@ -3,6 +3,28 @@ import XCTest
 @testable import n42_dump_xcode_buildsettings
 
 final class n42_dump_xcode_buildsettingsTests: XCTestCase {
+    func testParseOptionsUsesDefaultOutputPath() throws {
+        let options = try BuildSettingsTool.parseOptions(arguments: [])
+        XCTAssertTrue(options.allTargetsOutputURL.path.hasSuffix("PersistedLogs/buildConfigs/allTargets.json"))
+    }
+
+    func testParseOptionsAcceptsCustomAllTargetsOutputPath() throws {
+        let options = try BuildSettingsTool.parseOptions(arguments: ["--all-targets-output", "/tmp/custom-all-targets.json"])
+        XCTAssertEqual(options.allTargetsOutputURL.path, "/tmp/custom-all-targets.json")
+    }
+
+    func testParseOptionsThrowsForMissingValue() {
+        XCTAssertThrowsError(try BuildSettingsTool.parseOptions(arguments: ["--all-targets-output"])) { error in
+            XCTAssertEqual(error.localizedDescription, "Missing value for --all-targets-output.")
+        }
+    }
+
+    func testParseOptionsThrowsForUnknownArgument() {
+        XCTAssertThrowsError(try BuildSettingsTool.parseOptions(arguments: ["--unknown"])) { error in
+            XCTAssertEqual(error.localizedDescription, "Unknown argument: --unknown")
+        }
+    }
+
     func testSanitizeReplacesConfiguredPatterns() {
         let input = """
         {

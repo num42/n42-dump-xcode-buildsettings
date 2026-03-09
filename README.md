@@ -43,6 +43,12 @@ The dump is normalized to reduce machine- and build-specific noise.
 swift run n42-dump-xcode-buildsettings
 ```
 
+Custom all-targets temporary file location:
+
+```bash
+swift run n42-dump-xcode-buildsettings --all-targets-output /tmp/allTargets.json
+```
+
 ### Mint
 
 ```bash
@@ -59,6 +65,12 @@ Help:
 
 ```bash
 mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings --help
+```
+
+With custom all-targets output path:
+
+```bash
+mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings --all-targets-output /tmp/allTargets.json
 ```
 
 ## Requirements
@@ -79,4 +91,3 @@ Test:
 ```bash
 swift test
 ```
-
