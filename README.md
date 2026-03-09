@@ -12,10 +12,9 @@ xcodebuild -alltargets -showBuildSettings -json
 
 Then it:
 
-1. Writes a sanitized aggregate dump to `PersistedLogs/buildConfigs/allTargets.json`
-2. Splits that JSON by `buildSettings.TARGET_NAME`
+1. Sanitizes the full JSON dump in memory
+2. Splits by `buildSettings.TARGET_NAME`
 3. Writes one file per target: `PersistedLogs/buildConfigs/<TARGET_NAME>.json`
-4. Removes `PersistedLogs/buildConfigs/allTargets.json`
 
 ## Sanitization
 
@@ -43,7 +42,7 @@ The dump is normalized to reduce machine- and build-specific noise.
 swift run n42-dump-xcode-buildsettings
 ```
 
-Custom all-targets temporary file location:
+Custom output directory (derived from parent directory of the provided path):
 
 ```bash
 swift run n42-dump-xcode-buildsettings --all-targets-output /tmp/allTargets.json
@@ -67,7 +66,7 @@ Help:
 mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings --help
 ```
 
-With custom all-targets output path:
+With custom output directory (derived from parent directory of the provided path):
 
 ```bash
 mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings --all-targets-output /tmp/allTargets.json

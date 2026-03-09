@@ -21,7 +21,8 @@ struct n42_dump_xcode_buildsettings {
     private static func printUsage() {
         print("Usage: n42-dump-xcode-buildsettings [--all-targets-output <path>]")
         print("Runs xcodebuild settings dump, sanitizes volatile values, and writes per-target JSON files.")
-        print("Default all-targets output path: PersistedLogs/buildConfigs/allTargets.json")
+        print("No in-between all-targets file is written; the parent directory of --all-targets-output is used.")
+        print("Default value: PersistedLogs/buildConfigs/allTargets.json")
     }
 }
 
@@ -73,17 +74,13 @@ enum BuildSettingsTool {
     }
 
     static func run(options: Options = .defaults, fileManager: FileManager = .default) throws {
-        let combinedOutputURL = options.allTargetsOutputURL
-        let outputDirectory = combinedOutputURL.deletingLastPathComponent()
+        let outputDirectory = options.allTargetsOutputURL.deletingLastPathComponent()
 
         try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-        defer { try? fileManager.removeItem(at: combinedOutputURL) }
 
         let rawBuildSettings = try runCommand(executable: "/usr/bin/xcrun", arguments: xcodebuildCommand)
         let sanitizedBuildSettings = sanitize(rawBuildSettings)
-        try sanitizedBuildSettings.write(to: combinedOutputURL, atomically: true, encoding: .utf8)
-
-        let entries = try parseEntries(from: combinedOutputURL)
+        let entries = try parseEntries(fromJSONString: sanitizedBuildSettings)
         try writePerTargetFiles(entries: entries, to: outputDirectory, fileManager: fileManager)
     }
 
@@ -148,6 +145,13 @@ enum BuildSettingsTool {
 
     static func parseEntries(from url: URL) throws -> [BuildSettingsEntry] {
         let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode([BuildSettingsEntry].self, from: data)
+    }
+
+    static func parseEntries(fromJSONString jsonString: String) throws -> [BuildSettingsEntry] {
+        guard let data = jsonString.data(using: .utf8) else {
+            throw CLIError.invalidUTF8
+        }
         return try JSONDecoder().decode([BuildSettingsEntry].self, from: data)
     }
 
