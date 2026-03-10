@@ -79,17 +79,19 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
         let input = """
         {
           "N42_GIT_COMMIT_HASH" : "1A2B3C4D",
-          "CUSTOM_SECRET" : "abc123"
+          "CUSTOM_SECRET" : "abc123",
+          "VERSION_INFO_STRING" : "\\"@(#)PROGRAM:AppModule  PROJECT:ClinicApp-1\\""
         }
         """
 
         let output = BuildSettingsTool.sanitize(
             input,
-            additionalRedactedFields: ["N42_GIT_COMMIT_HASH", "CUSTOM_SECRET"]
+            additionalRedactedFields: ["N42_GIT_COMMIT_HASH", "CUSTOM_SECRET", "VERSION_INFO_STRING"]
         )
 
         XCTAssertTrue(output.contains(#""N42_GIT_COMMIT_HASH" : "REDACTED""#))
         XCTAssertTrue(output.contains(#""CUSTOM_SECRET" : "REDACTED""#))
+        XCTAssertTrue(output.contains(#""VERSION_INFO_STRING" : "REDACTED""#))
     }
 
     func testTargetBucketsGroupsByTargetNameAndIgnoresMissingTarget() {

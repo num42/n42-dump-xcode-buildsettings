@@ -202,7 +202,7 @@ enum BuildSettingsTool {
 
     static func sanitizeQuotedValue(in text: String, key: String, replacement: String) -> String {
         let escapedKey = NSRegularExpression.escapedPattern(for: key)
-        let pattern = #""\#(escapedKey)"\s*:\s*"[^"]*""#
+        let pattern = #""\#(escapedKey)"\s*:\s*"(?:\\.|[^"\\])*""#
         return replacingMatches(
             in: text,
             pattern: pattern,
