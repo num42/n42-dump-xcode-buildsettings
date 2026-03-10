@@ -5,6 +5,9 @@ import PackageDescription
 
 let package = Package(
     name: "n42-dump-xcode-buildsettings",
+    platforms: [
+        .macOS(.v10_15)
+    ],
     products: [
         .executable(
             name: "n42-dump-xcode-buildsettings",

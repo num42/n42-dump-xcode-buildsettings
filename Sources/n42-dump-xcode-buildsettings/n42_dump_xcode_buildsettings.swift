@@ -245,7 +245,10 @@ enum BuildSettingsTool {
         for targetName in buckets.keys.sorted() {
             guard let targetEntries = buckets[targetName] else { continue }
             let outputURL = outputDirectory.appendingPathComponent("\(targetName).json")
-            let encoded = try JSONSerialization.data(withJSONObject: targetEntries, options: [.prettyPrinted, .sortedKeys])
+            let encoded = try JSONSerialization.data(
+                withJSONObject: targetEntries,
+                options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            )
             try encoded.write(to: outputURL, options: .atomic)
         }
     }
