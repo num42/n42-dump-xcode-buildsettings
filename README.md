@@ -45,6 +45,15 @@ Use `--redact-field <KEY>` (repeatable) to redact additional keys with value `RE
 swift run n42-dump-xcode-buildsettings --redact-field N42_GIT_COMMIT_HASH
 ```
 
+## Swift package clones
+
+`xcodebuild -showBuildSettings` resolves the project's Swift packages. Without a clone directory
+they land in the default DerivedData, which on shared CI hosts means one multi-GB checkout per
+repository and runner slot that nothing removes. Pass `--cloned-source-packages-dir-path <path>`,
+or set `N42_SPM_CLONE_DIR` (the n42 runner slots export it), and the tool forwards it as
+`-clonedSourcePackagesDirPath`. (`-derivedDataPath` is not an option here: xcodebuild rejects it
+without a scheme.)
+
 ## Usage
 
 ### Swift Package Manager
