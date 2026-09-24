@@ -29,6 +29,35 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
         XCTAssertTrue(options.verbose)
     }
 
+    func testParseOptionsAcceptsClonedSourcePackagesDirPath() throws {
+        let options = try BuildSettingsTool.parseOptions(arguments: ["--cloned-source-packages-dir-path", "/tmp/clones"])
+        XCTAssertEqual(options.clonedSourcePackagesDirPath, "/tmp/clones")
+        XCTAssertThrowsError(try BuildSettingsTool.parseOptions(arguments: ["--cloned-source-packages-dir-path"])) { error in
+            XCTAssertEqual(error.localizedDescription, "Missing value for --cloned-source-packages-dir-path.")
+        }
+    }
+
+    func testXcodebuildArgumentsPinPackageClonesWhenADirectoryIsKnown() throws {
+        let base = ["xcodebuild", "-alltargets", "-showBuildSettings", "-json"]
+        let defaults = try BuildSettingsTool.parseOptions(arguments: [])
+        XCTAssertEqual(BuildSettingsTool.xcodebuildArguments(options: defaults, environment: [:]), base)
+        XCTAssertEqual(BuildSettingsTool.xcodebuildArguments(options: defaults, environment: ["N42_SPM_CLONE_DIR": ""]), base)
+        XCTAssertEqual(
+            BuildSettingsTool.xcodebuildArguments(options: defaults, environment: ["N42_SPM_CLONE_DIR": "/slots/slot-1/cache/swiftpm-clones"]),
+            base + ["-clonedSourcePackagesDirPath", "/slots/slot-1/cache/swiftpm-clones"]
+        )
+        let explicit = try BuildSettingsTool.parseOptions(arguments: ["--cloned-source-packages-dir-path", "/tmp/clones"])
+        XCTAssertEqual(
+            BuildSettingsTool.xcodebuildArguments(options: explicit, environment: ["N42_SPM_CLONE_DIR": "/env/clones"]),
+            base + ["-clonedSourcePackagesDirPath", "/tmp/clones"],
+            "the option wins over the environment"
+        )
+        XCTAssertFalse(
+            BuildSettingsTool.xcodebuildArguments(options: explicit, environment: [:]).contains("-derivedDataPath"),
+            "xcodebuild rejects -derivedDataPath without a scheme"
+        )
+    }
+
     func testParseOptionsThrowsForMissingValue() {
         XCTAssertThrowsError(try BuildSettingsTool.parseOptions(arguments: ["--all-targets-output"])) { error in
             XCTAssertEqual(error.localizedDescription, "Missing value for --all-targets-output.")

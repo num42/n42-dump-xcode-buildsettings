@@ -19,10 +19,12 @@ struct n42_dump_xcode_buildsettings {
     }
 
     private static func printUsage() {
-        print("Usage: n42-dump-xcode-buildsettings [--all-targets-output <path>] [--redact-field <KEY> ...] [--verbose]")
+        print("Usage: n42-dump-xcode-buildsettings [--all-targets-output <path>] [--redact-field <KEY> ...] [--cloned-source-packages-dir-path <path>] [--verbose]")
         print("Runs xcodebuild settings dump, sanitizes volatile values, and writes per-target JSON files.")
         print("No in-between all-targets file is written; the parent directory of --all-targets-output is used.")
         print("Use --redact-field to redact additional build setting keys with value REDACTED.")
+        print("Use --cloned-source-packages-dir-path to resolve Swift packages there instead of the default DerivedData;")
+        print("without it, $N42_SPM_CLONE_DIR is used when set (CI runner slots export it).")
         print("Use --verbose to print progress logs.")
         print("Default value: PersistedLogs/buildConfigs/allTargets.json")
     }
@@ -33,6 +35,9 @@ enum BuildSettingsTool {
         let allTargetsOutputURL: URL
         let additionalRedactedFields: Set<String>
         let verbose: Bool
+        /// Where xcodebuild resolves the project's Swift packages. `nil`
+        /// means the default (DerivedData), unless `N42_SPM_CLONE_DIR` is set.
+        var clonedSourcePackagesDirPath: String? = nil
 
         static let defaults = Options(
             allTargetsOutputURL: URL(fileURLWithPath: "PersistedLogs/buildConfigs/allTargets.json"),
@@ -52,6 +57,18 @@ enum BuildSettingsTool {
 
     static let xcodebuildCommand: [String] = ["xcodebuild", "-alltargets", "-showBuildSettings", "-json"]
 
+    /// The xcodebuild invocation, with a package clone directory when one is
+    /// known. `-showBuildSettings` resolves the project's Swift packages, and
+    /// without a clone directory that lands in the default DerivedData: on
+    /// shared CI hosts one 1.5-5 GB checkout per repository and runner slot
+    /// that nothing cleans up. `-derivedDataPath` cannot be used instead;
+    /// xcodebuild rejects it without a scheme.
+    static func xcodebuildArguments(options: Options, environment: [String: String]) -> [String] {
+        let fromEnvironment = environment["N42_SPM_CLONE_DIR"].flatMap { $0.isEmpty ? nil : $0 }
+        guard let clones = options.clonedSourcePackagesDirPath ?? fromEnvironment else { return xcodebuildCommand }
+        return xcodebuildCommand + ["-clonedSourcePackagesDirPath", clones]
+    }
+
     static let regexReplacements: [(pattern: String, replacement: String)] = [
         (#"/var/folders/[a-z0-9]*/[a-z0-9_]*/"#, "/var/folders/XX/XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/")
     ]
@@ -70,6 +87,7 @@ enum BuildSettingsTool {
         var allTargetsOutputURL = Options.defaults.allTargetsOutputURL
         var additionalRedactedFields = Set<String>()
         var verbose = false
+        var clonedSourcePackagesDirPath: String?
 
         while index < arguments.count {
             let argument = arguments[index]
@@ -86,6 +104,12 @@ enum BuildSettingsTool {
                     throw CLIError.invalidArguments("Missing value for --redact-field.")
                 }
                 additionalRedactedFields.insert(arguments[index])
+            case "--cloned-source-packages-dir-path":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError.invalidArguments("Missing value for --cloned-source-packages-dir-path.")
+                }
+                clonedSourcePackagesDirPath = arguments[index]
             case "--verbose", "-v":
                 verbose = true
             default:
@@ -97,7 +121,8 @@ enum BuildSettingsTool {
         return Options(
             allTargetsOutputURL: allTargetsOutputURL,
             additionalRedactedFields: additionalRedactedFields,
-            verbose: verbose
+            verbose: verbose,
+            clonedSourcePackagesDirPath: clonedSourcePackagesDirPath
         )
     }
 
@@ -109,10 +134,11 @@ enum BuildSettingsTool {
 
         try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
 
-        logger.log("Running command: /usr/bin/xcrun \(xcodebuildCommand.joined(separator: " "))")
+        let arguments = xcodebuildArguments(options: options, environment: ProcessInfo.processInfo.environment)
+        logger.log("Running command: /usr/bin/xcrun \(arguments.joined(separator: " "))")
         let rawBuildSettings = try runCommand(
             executable: "/usr/bin/xcrun",
-            arguments: xcodebuildCommand,
+            arguments: arguments,
             logger: logger
         )
         logger.log("Received \(rawBuildSettings.utf8.count) bytes of build settings JSON")
