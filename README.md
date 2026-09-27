@@ -10,6 +10,8 @@ The tool runs:
 xcrun xcodebuild -alltargets -showBuildSettings -json
 ```
 
+It adds `-clonedSourcePackagesDirPath` and `-packageAuthorizationProvider` when needed (see below).
+
 Then it:
 
 1. Sanitizes the full JSON dump in memory
@@ -53,6 +55,24 @@ repository and runner slot that nothing removes. Pass `--cloned-source-packages-
 or set `N42_SPM_CLONE_DIR` (the n42 runner slots export it), and the tool forwards it as
 `-clonedSourcePackagesDirPath`. (`-derivedDataPath` is not an option here: xcodebuild rejects it
 without a scheme.)
+
+## Package credentials on CI
+
+When a package needs downloading, e.g. a binary target such as MSAL's XCFramework zip, xcodebuild
+looks up credentials for the download host and for the host the download redirects to. Its default
+store is the login keychain. On a headless CI runner that keychain is locked, so the lookup waits for
+an unlock dialog nobody answers and xcodebuild hangs without printing anything.
+
+When `CI` is set (GitHub Actions sets it), the tool therefore passes
+`-packageAuthorizationProvider netrc`, so credentials come from `~/.netrc` only. Override it with
+`--package-authorization-provider keychain|netrc`.
+
+## Timeout
+
+The tool stops xcodebuild (and the git processes it started) after 1200 seconds (20 minutes) and
+fails with an error that includes xcodebuild's last output, rather than hanging until the CI job's
+own time limit. Change the limit with `--timeout <seconds>`. xcodebuild gets no stdin, so a prompt
+fails instead of waiting.
 
 ## Usage
 
