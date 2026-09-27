@@ -19,12 +19,15 @@ struct n42_dump_xcode_buildsettings {
     }
 
     private static func printUsage() {
-        print("Usage: n42-dump-xcode-buildsettings [--all-targets-output <path>] [--redact-field <KEY> ...] [--cloned-source-packages-dir-path <path>] [--verbose]")
+        print("Usage: n42-dump-xcode-buildsettings [--all-targets-output <path>] [--redact-field <KEY> ...] [--cloned-source-packages-dir-path <path>] [--package-authorization-provider keychain|netrc] [--timeout <seconds>] [--verbose]")
         print("Runs xcodebuild settings dump, sanitizes volatile values, and writes per-target JSON files.")
         print("No in-between all-targets file is written; the parent directory of --all-targets-output is used.")
         print("Use --redact-field to redact additional build setting keys with value REDACTED.")
         print("Use --cloned-source-packages-dir-path to resolve Swift packages there instead of the default DerivedData;")
         print("without it, $N42_SPM_CLONE_DIR is used when set (CI runner slots export it).")
+        print("Use --package-authorization-provider to choose where xcodebuild looks up package credentials;")
+        print("when $CI is set the default is netrc, so a headless machine never waits on a keychain prompt.")
+        print("Use --timeout to stop xcodebuild after that many seconds (default \(BuildSettingsTool.defaultTimeoutSeconds)).")
         print("Use --verbose to print progress logs.")
         print("Default value: PersistedLogs/buildConfigs/allTargets.json")
     }
@@ -38,6 +41,11 @@ enum BuildSettingsTool {
         /// Where xcodebuild resolves the project's Swift packages. `nil`
         /// means the default (DerivedData), unless `N42_SPM_CLONE_DIR` is set.
         var clonedSourcePackagesDirPath: String? = nil
+        /// Credential store for package resolution (`keychain` or `netrc`).
+        /// `nil` means netrc when `CI` is set, else xcodebuild's default.
+        var packageAuthorizationProvider: String? = nil
+        /// Seconds after which xcodebuild is stopped and the run fails.
+        var timeoutSeconds: Int = BuildSettingsTool.defaultTimeoutSeconds
 
         static let defaults = Options(
             allTargetsOutputURL: URL(fileURLWithPath: "PersistedLogs/buildConfigs/allTargets.json"),
@@ -57,16 +65,41 @@ enum BuildSettingsTool {
 
     static let xcodebuildCommand: [String] = ["xcodebuild", "-alltargets", "-showBuildSettings", "-json"]
 
+    /// Generous: a cold package resolution of a large project takes a few
+    /// minutes. Without a limit a stuck resolution hangs until the CI job's
+    /// own time limit, printing nothing.
+    static let defaultTimeoutSeconds = 1200
+
+    static let packageAuthorizationProviders: Set<String> = ["keychain", "netrc"]
+
     /// The xcodebuild invocation, with a package clone directory when one is
     /// known. `-showBuildSettings` resolves the project's Swift packages, and
     /// without a clone directory that lands in the default DerivedData: on
     /// shared CI hosts one 1.5-5 GB checkout per repository and runner slot
     /// that nothing cleans up. `-derivedDataPath` cannot be used instead;
     /// xcodebuild rejects it without a scheme.
+    ///
+    /// On CI the package credentials come from ~/.netrc. xcodebuild's default
+    /// store is the login keychain, and a package download (a binary target
+    /// such as MSAL's XCFramework zip) asks it for credentials for the
+    /// download host and again for the host the download redirects to. On a
+    /// headless runner the keychain is locked, so that query waits for an
+    /// unlock dialog nobody answers and xcodebuild hangs without output.
     static func xcodebuildArguments(options: Options, environment: [String: String]) -> [String] {
+        var arguments = xcodebuildCommand
         let fromEnvironment = environment["N42_SPM_CLONE_DIR"].flatMap { $0.isEmpty ? nil : $0 }
-        guard let clones = options.clonedSourcePackagesDirPath ?? fromEnvironment else { return xcodebuildCommand }
-        return xcodebuildCommand + ["-clonedSourcePackagesDirPath", clones]
+        if let clones = options.clonedSourcePackagesDirPath ?? fromEnvironment {
+            arguments += ["-clonedSourcePackagesDirPath", clones]
+        }
+        if let provider = options.packageAuthorizationProvider ?? (isCI(environment) ? "netrc" : nil) {
+            arguments += ["-packageAuthorizationProvider", provider]
+        }
+        return arguments
+    }
+
+    static func isCI(_ environment: [String: String]) -> Bool {
+        guard let value = environment["CI"]?.lowercased(), !value.isEmpty else { return false }
+        return !["0", "false", "no"].contains(value)
     }
 
     static let regexReplacements: [(pattern: String, replacement: String)] = [
@@ -88,6 +121,8 @@ enum BuildSettingsTool {
         var additionalRedactedFields = Set<String>()
         var verbose = false
         var clonedSourcePackagesDirPath: String?
+        var packageAuthorizationProvider: String?
+        var timeoutSeconds = defaultTimeoutSeconds
 
         while index < arguments.count {
             let argument = arguments[index]
@@ -110,6 +145,24 @@ enum BuildSettingsTool {
                     throw CLIError.invalidArguments("Missing value for --cloned-source-packages-dir-path.")
                 }
                 clonedSourcePackagesDirPath = arguments[index]
+            case "--package-authorization-provider":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError.invalidArguments("Missing value for --package-authorization-provider.")
+                }
+                guard packageAuthorizationProviders.contains(arguments[index]) else {
+                    throw CLIError.invalidArguments("--package-authorization-provider must be keychain or netrc, not \(arguments[index]).")
+                }
+                packageAuthorizationProvider = arguments[index]
+            case "--timeout":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError.invalidArguments("Missing value for --timeout.")
+                }
+                guard let seconds = Int(arguments[index]), seconds > 0 else {
+                    throw CLIError.invalidArguments("--timeout needs a positive number of seconds, not \(arguments[index]).")
+                }
+                timeoutSeconds = seconds
             case "--verbose", "-v":
                 verbose = true
             default:
@@ -122,7 +175,9 @@ enum BuildSettingsTool {
             allTargetsOutputURL: allTargetsOutputURL,
             additionalRedactedFields: additionalRedactedFields,
             verbose: verbose,
-            clonedSourcePackagesDirPath: clonedSourcePackagesDirPath
+            clonedSourcePackagesDirPath: clonedSourcePackagesDirPath,
+            packageAuthorizationProvider: packageAuthorizationProvider,
+            timeoutSeconds: timeoutSeconds
         )
     }
 
@@ -139,6 +194,7 @@ enum BuildSettingsTool {
         let rawBuildSettings = try runCommand(
             executable: "/usr/bin/xcrun",
             arguments: arguments,
+            timeoutSeconds: options.timeoutSeconds,
             logger: logger
         )
         logger.log("Received \(rawBuildSettings.utf8.count) bytes of build settings JSON")
@@ -155,10 +211,19 @@ enum BuildSettingsTool {
         logger.log("Wrote \(targetBuckets(entries: entries).count) per-target JSON files")
     }
 
-    static func runCommand(executable: String, arguments: [String], logger: Logger = Logger(isVerbose: false)) throws -> String {
+    static func runCommand(
+        executable: String,
+        arguments: [String],
+        timeoutSeconds: Int = defaultTimeoutSeconds,
+        logger: Logger = Logger(isVerbose: false)
+    ) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        // Nothing may wait for an answer on stdin: a prompt fails instead.
+        process.standardInput = FileHandle.nullDevice
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
 
         let fileManager = FileManager.default
         let stdoutURL = fileManager.temporaryDirectory.appendingPathComponent("n42-dump-stdout-\(UUID().uuidString).tmp")
@@ -176,7 +241,23 @@ enum BuildSettingsTool {
         process.standardError = stderrHandle
 
         try process.run()
-        process.waitUntilExit()
+        if finished.wait(timeout: .now() + .seconds(timeoutSeconds)) == .timedOut {
+            logger.log("xcodebuild still running after \(timeoutSeconds) s, stopping it and its child processes")
+            // xcodebuild's git and download children run in process groups of
+            // their own and would outlive it; collect them while they are
+            // still its descendants.
+            let tree = [process.processIdentifier] + descendants(of: process.processIdentifier)
+            tree.forEach { kill($0, SIGTERM) }
+            if finished.wait(timeout: .now() + .seconds(15)) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                finished.wait()
+            }
+            tree.dropFirst().forEach { kill($0, SIGKILL) }
+            stdoutHandle.closeFile()
+            stderrHandle.closeFile()
+            let errorText = (try? String(contentsOf: stderrURL, encoding: .utf8)) ?? ""
+            throw CLIError.timedOut(seconds: timeoutSeconds, stderr: errorText)
+        }
         stdoutHandle.closeFile()
         stderrHandle.closeFile()
 
@@ -200,6 +281,16 @@ enum BuildSettingsTool {
         }
 
         return output
+    }
+
+    /// All processes below `pid`, children before grandchildren.
+    static func descendants(of pid: pid_t) -> [pid_t] {
+        var children = [pid_t](repeating: 0, count: 1024)
+        // Takes the buffer size in bytes, returns the number of pids.
+        let count = proc_listchildpids(pid, &children, Int32(children.count * MemoryLayout<pid_t>.size))
+        guard count > 0 else { return [] }
+        let direct = children.prefix(Int(count)).filter { $0 > 0 }
+        return direct + direct.flatMap { descendants(of: $0) }
     }
 
     static func sanitize(_ input: String, additionalRedactedFields: Set<String> = []) -> String {
@@ -285,6 +376,7 @@ enum CLIError: LocalizedError {
     case invalidUTF8
     case invalidJSONStructure
     case invalidArguments(String)
+    case timedOut(seconds: Int, stderr: String)
 
     var errorDescription: String? {
         switch self {
@@ -296,6 +388,17 @@ enum CLIError: LocalizedError {
             return "xcodebuild output JSON has an unexpected structure."
         case let .invalidArguments(message):
             return message
+        case let .timedOut(seconds, stderr):
+            let tail = stderr
+                .split(separator: "\n", omittingEmptySubsequences: true)
+                .suffix(20)
+                .joined(separator: "\n")
+            return """
+            xcodebuild -showBuildSettings did not finish within \(seconds) s and was stopped. \
+            It resolves the project's Swift packages first, so it most likely waited for package \
+            credentials (a keychain prompt nobody can answer on a headless machine), a download, or a \
+            lock on the package clone directory. Use --timeout to change the limit.
+            """ + (tail.isEmpty ? "" : "\nLast xcodebuild output:\n\(tail)")
         }
     }
 }

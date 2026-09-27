@@ -58,6 +58,88 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
         )
     }
 
+    func testXcodebuildArgumentsUseNetrcCredentialsOnCI() throws {
+        let base = ["xcodebuild", "-alltargets", "-showBuildSettings", "-json"]
+        let defaults = try BuildSettingsTool.parseOptions(arguments: [])
+        XCTAssertEqual(
+            BuildSettingsTool.xcodebuildArguments(options: defaults, environment: ["CI": "true"]),
+            base + ["-packageAuthorizationProvider", "netrc"],
+            "a headless CI machine cannot answer a keychain prompt"
+        )
+        XCTAssertEqual(BuildSettingsTool.xcodebuildArguments(options: defaults, environment: ["CI": "false"]), base)
+        XCTAssertEqual(BuildSettingsTool.xcodebuildArguments(options: defaults, environment: ["CI": ""]), base)
+        XCTAssertEqual(
+            BuildSettingsTool.xcodebuildArguments(
+                options: defaults,
+                environment: ["CI": "1", "N42_SPM_CLONE_DIR": "/slots/slot-3/cache/swiftpm"]
+            ),
+            base + ["-clonedSourcePackagesDirPath", "/slots/slot-3/cache/swiftpm", "-packageAuthorizationProvider", "netrc"]
+        )
+        let keychain = try BuildSettingsTool.parseOptions(arguments: ["--package-authorization-provider", "keychain"])
+        XCTAssertEqual(
+            BuildSettingsTool.xcodebuildArguments(options: keychain, environment: ["CI": "true"]),
+            base + ["-packageAuthorizationProvider", "keychain"],
+            "the option wins over the CI default"
+        )
+    }
+
+    func testParseOptionsValidatesPackageAuthorizationProviderAndTimeout() throws {
+        XCTAssertThrowsError(try BuildSettingsTool.parseOptions(arguments: ["--package-authorization-provider", "ssh"])) { error in
+            XCTAssertEqual(error.localizedDescription, "--package-authorization-provider must be keychain or netrc, not ssh.")
+        }
+        XCTAssertEqual(try BuildSettingsTool.parseOptions(arguments: []).timeoutSeconds, BuildSettingsTool.defaultTimeoutSeconds)
+        XCTAssertEqual(try BuildSettingsTool.parseOptions(arguments: ["--timeout", "90"]).timeoutSeconds, 90)
+        for value in ["0", "-5", "soon"] {
+            XCTAssertThrowsError(try BuildSettingsTool.parseOptions(arguments: ["--timeout", value])) { error in
+                XCTAssertEqual(error.localizedDescription, "--timeout needs a positive number of seconds, not \(value).")
+            }
+        }
+        XCTAssertThrowsError(try BuildSettingsTool.parseOptions(arguments: ["--timeout"])) { error in
+            XCTAssertEqual(error.localizedDescription, "Missing value for --timeout.")
+        }
+    }
+
+    func testRunCommandStopsAHangingCommandAndReportsIt() throws {
+        let start = Date()
+        XCTAssertThrowsError(
+            try BuildSettingsTool.runCommand(
+                executable: "/bin/sh",
+                arguments: ["-c", "echo resolving packages >&2; sleep 60"],
+                timeoutSeconds: 1
+            )
+        ) { error in
+            guard case let CLIError.timedOut(seconds, stderr) = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertEqual(seconds, 1)
+            XCTAssertEqual(stderr, "resolving packages\n")
+            XCTAssertTrue(error.localizedDescription.contains("did not finish within 1 s"))
+            XCTAssertTrue(error.localizedDescription.hasSuffix("Last xcodebuild output:\nresolving packages"))
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 20)
+    }
+
+    func testRunCommandAlsoStopsTheChildProcessesOfAHangingCommand() throws {
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent("n42-dump-child-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        // The child is started in the background, like xcodebuild's git
+        // processes, and writes its pid for the test to check.
+        XCTAssertThrowsError(
+            try BuildSettingsTool.runCommand(
+                executable: "/bin/sh",
+                arguments: ["-c", "sleep 60 & echo $! > '\(marker.path)'; wait"],
+                timeoutSeconds: 1
+            )
+        )
+        let childPID = try XCTUnwrap(pid_t(String(contentsOf: marker, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)))
+        XCTAssertEqual(kill(childPID, 0), -1, "the background child was left running")
+    }
+
+    func testRunCommandGivesTheCommandNoStdin() throws {
+        // cat would block forever on an inherited terminal or pipe.
+        XCTAssertEqual(try BuildSettingsTool.runCommand(executable: "/bin/cat", arguments: [], timeoutSeconds: 10), "")
+    }
+
     func testParseOptionsThrowsForMissingValue() {
         XCTAssertThrowsError(try BuildSettingsTool.parseOptions(arguments: ["--all-targets-output"])) { error in
             XCTAssertEqual(error.localizedDescription, "Missing value for --all-targets-output.")
