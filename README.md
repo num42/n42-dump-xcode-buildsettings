@@ -74,6 +74,34 @@ fails with an error that includes xcodebuild's last output, rather than hanging 
 own time limit. Change the limit with `--timeout <seconds>`. xcodebuild gets no stdin, so a prompt
 fails instead of waiting.
 
+## Skipping unchanged projects
+
+`--skip-if-unchanged` skips the dump when the generated project has not changed since the last one.
+The tool hashes (SHA-256) everything that decides the dump:
+
+- the project's `project.pbxproj` and `xcshareddata/xcschemes/*.xcscheme` (not `xcuserdata`);
+- `xcodebuild -version`, because the default build settings come from Xcode;
+- the tool's own version and the `--redact-field` keys.
+
+Before hashing, the project files get the same cleanup as the dump, and more, so the hash is the
+same in every work tree and on every runner slot: the work-tree path and the home directory are
+replaced, the redacted keys lose their values (XcodeGen writes the build number and commit hash
+into the project), and XcodeGen's random `TEMP_<UUID>` object ids and the object order that follows
+from them are normalised.
+
+The hash is stored as `N42_PROJECT_HASH` in the `buildSettings` of every entry in the per-target
+files. On the next run:
+
+- If every `*.json` in the output directory carries the current hash, the tool prints that the build
+  settings are unchanged and exits 0 without running `xcodebuild -showBuildSettings`.
+- Otherwise it dumps, deletes the old `*.json` in the output directory (so files of deleted targets
+  go away), and writes the new files with the hash.
+
+The tool hashes the only `.xcodeproj` in the working directory. If there is none or more than one,
+name it with `--project <path>`; xcodebuild then dumps that project too.
+
+Without `--skip-if-unchanged` nothing is hashed and the output is the same as before.
+
 ## Usage
 
 ### Swift Package Manager
@@ -100,6 +128,12 @@ With additional redacted fields:
 
 ```bash
 swift run n42-dump-xcode-buildsettings --redact-field N42_GIT_COMMIT_HASH --redact-field CUSTOM_SECRET
+```
+
+Skipping the dump when the project is unchanged:
+
+```bash
+swift run n42-dump-xcode-buildsettings --skip-if-unchanged --redact-field N42_GIT_COMMIT_HASH
 ```
 
 With verbose logging:
@@ -142,6 +176,12 @@ With additional redacted fields:
 
 ```bash
 mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings --redact-field N42_GIT_COMMIT_HASH --redact-field CUSTOM_SECRET
+```
+
+Skipping the dump when the project is unchanged:
+
+```bash
+mint run <owner>/n42-dump-xcode-buildsettings n42-dump-xcode-buildsettings --skip-if-unchanged --redact-field N42_GIT_COMMIT_HASH
 ```
 
 With verbose logging:
