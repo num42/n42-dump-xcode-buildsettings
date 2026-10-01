@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 @main
@@ -19,7 +20,7 @@ struct n42_dump_xcode_buildsettings {
     }
 
     private static func printUsage() {
-        print("Usage: n42-dump-xcode-buildsettings [--all-targets-output <path>] [--redact-field <KEY> ...] [--cloned-source-packages-dir-path <path>] [--package-authorization-provider keychain|netrc] [--timeout <seconds>] [--verbose]")
+        print("Usage: n42-dump-xcode-buildsettings [--all-targets-output <path>] [--redact-field <KEY> ...] [--cloned-source-packages-dir-path <path>] [--package-authorization-provider keychain|netrc] [--timeout <seconds>] [--skip-if-unchanged] [--project <path>] [--verbose]")
         print("Runs xcodebuild settings dump, sanitizes volatile values, and writes per-target JSON files.")
         print("No in-between all-targets file is written; the parent directory of --all-targets-output is used.")
         print("Use --redact-field to redact additional build setting keys with value REDACTED.")
@@ -28,6 +29,10 @@ struct n42_dump_xcode_buildsettings {
         print("Use --package-authorization-provider to choose where xcodebuild looks up package credentials;")
         print("when $CI is set the default is netrc, so a headless machine never waits on a keychain prompt.")
         print("Use --timeout to stop xcodebuild after that many seconds (default \(BuildSettingsTool.defaultTimeoutSeconds)).")
+        print("Use --skip-if-unchanged to skip the dump when the per-target files already carry the current")
+        print("\(BuildSettingsTool.projectHashKey) (generated project, xcodebuild -version, tool version and redact fields);")
+        print("otherwise the old per-target files are replaced, so files of deleted targets go away.")
+        print("Use --project to name the .xcodeproj when the working directory does not hold exactly one.")
         print("Use --verbose to print progress logs.")
         print("Default value: PersistedLogs/buildConfigs/allTargets.json")
     }
@@ -46,6 +51,10 @@ enum BuildSettingsTool {
         var packageAuthorizationProvider: String? = nil
         /// Seconds after which xcodebuild is stopped and the run fails.
         var timeoutSeconds: Int = BuildSettingsTool.defaultTimeoutSeconds
+        var skipIfUnchanged = false
+        /// The .xcodeproj to dump. `nil` lets xcodebuild pick the one in the
+        /// working directory.
+        var projectPath: String? = nil
 
         static let defaults = Options(
             allTargetsOutputURL: URL(fileURLWithPath: "PersistedLogs/buildConfigs/allTargets.json"),
@@ -64,6 +73,12 @@ enum BuildSettingsTool {
     }
 
     static let xcodebuildCommand: [String] = ["xcodebuild", "-alltargets", "-showBuildSettings", "-json"]
+
+    /// Part of the project hash, so a release that changes the output dumps
+    /// again. Keep it in step with the release tag.
+    static let version = "1.0.5"
+
+    static let projectHashKey = "N42_PROJECT_HASH"
 
     /// Generous: a cold package resolution of a large project takes a few
     /// minutes. Without a limit a stuck resolution hangs until the CI job's
@@ -87,6 +102,9 @@ enum BuildSettingsTool {
     /// unlock dialog nobody answers and xcodebuild hangs without output.
     static func xcodebuildArguments(options: Options, environment: [String: String]) -> [String] {
         var arguments = xcodebuildCommand
+        if let project = options.projectPath {
+            arguments += ["-project", project]
+        }
         let fromEnvironment = environment["N42_SPM_CLONE_DIR"].flatMap { $0.isEmpty ? nil : $0 }
         if let clones = options.clonedSourcePackagesDirPath ?? fromEnvironment {
             arguments += ["-clonedSourcePackagesDirPath", clones]
@@ -123,6 +141,8 @@ enum BuildSettingsTool {
         var clonedSourcePackagesDirPath: String?
         var packageAuthorizationProvider: String?
         var timeoutSeconds = defaultTimeoutSeconds
+        var skipIfUnchanged = false
+        var projectPath: String?
 
         while index < arguments.count {
             let argument = arguments[index]
@@ -163,6 +183,14 @@ enum BuildSettingsTool {
                     throw CLIError.invalidArguments("--timeout needs a positive number of seconds, not \(arguments[index]).")
                 }
                 timeoutSeconds = seconds
+            case "--skip-if-unchanged":
+                skipIfUnchanged = true
+            case "--project":
+                index += 1
+                guard index < arguments.count else {
+                    throw CLIError.invalidArguments("Missing value for --project.")
+                }
+                projectPath = arguments[index]
             case "--verbose", "-v":
                 verbose = true
             default:
@@ -177,26 +205,57 @@ enum BuildSettingsTool {
             verbose: verbose,
             clonedSourcePackagesDirPath: clonedSourcePackagesDirPath,
             packageAuthorizationProvider: packageAuthorizationProvider,
-            timeoutSeconds: timeoutSeconds
+            timeoutSeconds: timeoutSeconds,
+            skipIfUnchanged: skipIfUnchanged,
+            projectPath: projectPath
         )
     }
 
-    static func run(options: Options = .defaults, fileManager: FileManager = .default) throws {
+    /// `xcrun` runs `/usr/bin/xcrun` with the given arguments and returns its
+    /// stdout; tests replace it.
+    static func run(
+        options: Options = .defaults,
+        fileManager: FileManager = .default,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        homeDirectory: String = NSHomeDirectory(),
+        xcrun: (([String]) throws -> String)? = nil
+    ) throws {
         let outputDirectory = options.allTargetsOutputURL.deletingLastPathComponent()
         let logger = Logger(isVerbose: options.verbose)
+        let xcrun = xcrun ?? { arguments in
+            try runCommand(
+                executable: "/usr/bin/xcrun",
+                arguments: arguments,
+                timeoutSeconds: options.timeoutSeconds,
+                logger: logger
+            )
+        }
 
         logger.log("Preparing output directory: \(outputDirectory.path)")
 
         try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
 
-        let arguments = xcodebuildArguments(options: options, environment: ProcessInfo.processInfo.environment)
+        var projectHash: String?
+        if options.skipIfUnchanged {
+            let projectURL = try locateProject(path: options.projectPath, fileManager: fileManager)
+            let hash = try self.projectHash(
+                projectURL: projectURL,
+                xcodeVersion: xcrun(["xcodebuild", "-version"]),
+                additionalRedactedFields: options.additionalRedactedFields,
+                homeDirectory: homeDirectory,
+                fileManager: fileManager
+            )
+            logger.log("\(projectHashKey) of \(projectURL.path): \(hash)")
+            if try dumpsMatch(projectHash: hash, in: outputDirectory, fileManager: fileManager) {
+                print("Build settings unchanged (\(projectHashKey) \(hash)), skipping xcodebuild -showBuildSettings.")
+                return
+            }
+            projectHash = hash
+        }
+
+        let arguments = xcodebuildArguments(options: options, environment: environment)
         logger.log("Running command: /usr/bin/xcrun \(arguments.joined(separator: " "))")
-        let rawBuildSettings = try runCommand(
-            executable: "/usr/bin/xcrun",
-            arguments: arguments,
-            timeoutSeconds: options.timeoutSeconds,
-            logger: logger
-        )
+        let rawBuildSettings = try xcrun(arguments)
         logger.log("Received \(rawBuildSettings.utf8.count) bytes of build settings JSON")
 
         let sanitizedBuildSettings = sanitize(
@@ -205,10 +264,185 @@ enum BuildSettingsTool {
         )
         logger.log("Sanitized JSON size: \(sanitizedBuildSettings.utf8.count) bytes")
 
-        let entries = try parseEntries(fromJSONString: sanitizedBuildSettings)
+        var entries = try parseEntries(fromJSONString: sanitizedBuildSettings)
         logger.log("Parsed \(entries.count) build settings entries")
+        if let projectHash {
+            entries = addingProjectHash(projectHash, to: entries)
+            let removed = try removeDumps(in: outputDirectory, fileManager: fileManager)
+            logger.log("Removed \(removed) old per-target JSON files")
+        }
         try writePerTargetFiles(entries: entries, to: outputDirectory, fileManager: fileManager)
         logger.log("Wrote \(targetBuckets(entries: entries).count) per-target JSON files")
+    }
+
+    /// The .xcodeproj at `path`, or the only one in the working directory.
+    static func locateProject(path: String?, fileManager: FileManager = .default) throws -> URL {
+        if let path {
+            let url = URL(fileURLWithPath: path)
+            guard fileManager.fileExists(atPath: url.appendingPathComponent("project.pbxproj").path) else {
+                throw CLIError.invalidArguments("No project.pbxproj in \(url.path).")
+            }
+            return url
+        }
+        let directory = fileManager.currentDirectoryPath
+        let projects = try fileManager.contentsOfDirectory(atPath: directory)
+            .filter { $0.hasSuffix(".xcodeproj") }
+        guard projects.count == 1, let project = projects.first else {
+            throw CLIError.invalidArguments(
+                "Found \(projects.count) .xcodeproj in \(directory); name the one to hash with --project <path>."
+            )
+        }
+        return URL(fileURLWithPath: directory).appendingPathComponent(project)
+    }
+
+    /// SHA-256 over everything that decides the dump: the project file and
+    /// shared schemes (no xcuserdata), the Xcode version (default settings
+    /// come from Xcode), and this tool's version and redact fields.
+    ///
+    /// The project files go through the same cleanup as the dump, so the
+    /// hash does not depend on the work-tree path or home directory, and
+    /// values the dump redacts (XcodeGen writes the build number and commit
+    /// hash into the project) do not change it either.
+    static func projectHash(
+        projectURL: URL,
+        xcodeVersion: String,
+        additionalRedactedFields: Set<String>,
+        homeDirectory: String,
+        fileManager: FileManager = .default
+    ) throws -> String {
+        let schemesURL = projectURL.appendingPathComponent("xcshareddata/xcschemes")
+        let schemes = ((try? fileManager.contentsOfDirectory(atPath: schemesURL.path)) ?? [])
+            .filter { $0.hasSuffix(".xcscheme") }
+            .sorted()
+        let files = ["project.pbxproj"] + schemes.map { "xcshareddata/xcschemes/\($0)" }
+
+        var parts = [
+            "tool \(version)",
+            "redact \(additionalRedactedFields.sorted().joined(separator: ","))",
+            "xcodebuild \(xcodeVersion.trimmingCharacters(in: .whitespacesAndNewlines))"
+        ]
+        for file in files {
+            let contents = try String(contentsOf: projectURL.appendingPathComponent(file), encoding: .utf8)
+            let sanitized = sanitizeProjectFile(
+                contents,
+                projectDirectory: projectURL.deletingLastPathComponent(),
+                homeDirectory: homeDirectory,
+                additionalRedactedFields: additionalRedactedFields
+            )
+            parts.append("\(file)\n\(sanitized)")
+        }
+
+        let digest = SHA256.hash(data: Data(parts.joined(separator: "\u{0}").utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Project-file counterpart of `sanitize`: the same path cleanup plus the
+    /// work tree and home directory, the redacted keys in `KEY = value;`
+    /// form, and XcodeGen's random object ids.
+    static func sanitizeProjectFile(
+        _ input: String,
+        projectDirectory: URL,
+        homeDirectory: String,
+        additionalRedactedFields: Set<String> = []
+    ) -> String {
+        var output = input
+        let projectPaths = Set([projectDirectory.standardizedFileURL.path, projectDirectory.resolvingSymlinksInPath().path])
+        // Longest first: the work tree usually lies inside the home directory.
+        for path in projectPaths.sorted(by: { $0.count > $1.count }) {
+            output = output.replacingOccurrences(of: path, with: "$(PROJECT_DIR)")
+        }
+        if !homeDirectory.isEmpty {
+            output = output.replacingOccurrences(of: homeDirectory, with: "$(HOME)")
+        }
+        for rule in regexReplacements {
+            output = replacingMatches(in: output, pattern: rule.pattern, with: rule.replacement)
+        }
+        let keys = Set(quotedValueReplacements.map(\.key)).union(additionalRedactedFields)
+        for key in keys.sorted() {
+            let escapedKey = NSRegularExpression.escapedPattern(for: key)
+            output = replacingMatches(
+                in: output,
+                pattern: #"(?<![A-Za-z0-9_])\#(escapedKey) = (?:"(?:\\.|[^"\\])*"|[^;"]*);"#,
+                with: "\(key) = REDACTED;"
+            )
+        }
+        // XcodeGen gives some package product dependencies a random
+        // "TEMP_<UUID>" id on every generation, and a project file lists its
+        // objects sorted by id, so both the ids and the object order change.
+        output = replacingMatches(in: output, pattern: #"TEMP_[0-9A-Fa-f-]{36}"#, with: "TEMP")
+        return sortingObjectsWithinSections(output)
+    }
+
+    /// Sorts the objects (blocks starting at two tabs of indentation, up to
+    /// their `};`) inside each `/* Begin … section */`. Their order only follows their ids, so
+    /// nothing is lost.
+    static func sortingObjectsWithinSections(_ input: String) -> String {
+        var output: [String] = []
+        var objects: [[String]] = []
+        var inSection = false
+        for line in input.components(separatedBy: "\n") {
+            if line.hasPrefix("/* Begin "), line.hasSuffix(" section */") {
+                output.append(line)
+                inSection = true
+            } else if inSection, line.hasPrefix("/* End "), line.hasSuffix(" section */") {
+                output += objects.map { $0.joined(separator: "\n") }.sorted()
+                output.append(line)
+                objects = []
+                inSection = false
+            } else if inSection, line.hasPrefix("\t\t\t") || line == "\t\t};", !objects.isEmpty {
+                objects[objects.count - 1].append(line)
+            } else if inSection {
+                objects.append([line])
+            } else {
+                output.append(line)
+            }
+        }
+        output += objects.flatMap { $0 }
+        return output.joined(separator: "\n")
+    }
+
+    /// Whether the output directory holds per-target files and every entry
+    /// in them carries `projectHash`.
+    static func dumpsMatch(projectHash: String, in directory: URL, fileManager: FileManager = .default) throws -> Bool {
+        let dumps = try dumpFiles(in: directory, fileManager: fileManager)
+        guard !dumps.isEmpty else { return false }
+        return dumps.allSatisfy { url in
+            guard
+                let data = try? Data(contentsOf: url),
+                let entries = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],
+                !entries.isEmpty
+            else {
+                return false
+            }
+            return entries.allSatisfy { entry in
+                (entry["buildSettings"] as? [String: Any])?[projectHashKey] as? String == projectHash
+            }
+        }
+    }
+
+    static func addingProjectHash(_ projectHash: String, to entries: [[String: Any]]) -> [[String: Any]] {
+        entries.map { entry in
+            guard var buildSettings = entry["buildSettings"] as? [String: Any] else { return entry }
+            buildSettings[projectHashKey] = projectHash
+            var entry = entry
+            entry["buildSettings"] = buildSettings
+            return entry
+        }
+    }
+
+    /// Deletes the per-target files, so targets that no longer exist lose
+    /// theirs. Returns how many were removed.
+    static func removeDumps(in directory: URL, fileManager: FileManager = .default) throws -> Int {
+        let dumps = try dumpFiles(in: directory, fileManager: fileManager)
+        try dumps.forEach { try fileManager.removeItem(at: $0) }
+        return dumps.count
+    }
+
+    static func dumpFiles(in directory: URL, fileManager: FileManager = .default) throws -> [URL] {
+        try fileManager.contentsOfDirectory(atPath: directory.path)
+            .filter { $0.hasSuffix(".json") }
+            .sorted()
+            .map { directory.appendingPathComponent($0) }
     }
 
     static func runCommand(
