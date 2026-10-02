@@ -29,9 +29,10 @@ struct n42_dump_xcode_buildsettings {
         print("Use --package-authorization-provider to choose where xcodebuild looks up package credentials;")
         print("when $CI is set the default is netrc, so a headless machine never waits on a keychain prompt.")
         print("Use --timeout to stop xcodebuild after that many seconds (default \(BuildSettingsTool.defaultTimeoutSeconds)).")
-        print("Use --skip-if-unchanged to skip the dump when the per-target files already carry the current")
-        print("\(BuildSettingsTool.projectHashKey) (generated project, xcodebuild -version, tool version and redact fields);")
-        print("otherwise the old per-target files are replaced, so files of deleted targets go away.")
+        print("Use --skip-if-unchanged to skip the dump when \(BuildSettingsTool.hashFileName) in the output directory holds the")
+        print("current project hash (generated project, xcodebuild -version, tool version and redact fields);")
+        print("otherwise the old per-target files are replaced, so files of deleted targets go away, and")
+        print("\(BuildSettingsTool.hashFileName) is written last.")
         print("Use --project to name the .xcodeproj when the working directory does not hold exactly one.")
         print("Use --verbose to print progress logs.")
         print("Default value: PersistedLogs/buildConfigs/allTargets.json")
@@ -76,9 +77,14 @@ enum BuildSettingsTool {
 
     /// Part of the project hash, so a release that changes the output dumps
     /// again. Keep it in step with the release tag.
-    static let version = "1.0.5"
+    static let version = "1.0.6"
 
-    static let projectHashKey = "N42_PROJECT_HASH"
+    /// Holds the project hash of the per-target files next to it.
+    static let hashFileName = "hash.txt"
+
+    /// Where 1.0.5 stored the hash: in every entry's `buildSettings`. Files
+    /// that still carry it are dumped again, so the new files lose it.
+    static let legacyProjectHashKey = "N42_PROJECT_HASH"
 
     /// Generous: a cold package resolution of a large project takes a few
     /// minutes. Without a limit a stuck resolution hangs until the CI job's
@@ -245,9 +251,9 @@ enum BuildSettingsTool {
                 homeDirectory: homeDirectory,
                 fileManager: fileManager
             )
-            logger.log("\(projectHashKey) of \(projectURL.path): \(hash)")
+            logger.log("Project hash of \(projectURL.path): \(hash)")
             if try dumpsMatch(projectHash: hash, in: outputDirectory, fileManager: fileManager) {
-                print("Build settings unchanged (\(projectHashKey) \(hash)), skipping xcodebuild -showBuildSettings.")
+                print("Build settings unchanged (\(hashFileName) \(hash)), skipping xcodebuild -showBuildSettings.")
                 return
             }
             projectHash = hash
@@ -264,15 +270,24 @@ enum BuildSettingsTool {
         )
         logger.log("Sanitized JSON size: \(sanitizedBuildSettings.utf8.count) bytes")
 
-        var entries = try parseEntries(fromJSONString: sanitizedBuildSettings)
+        let entries = try parseEntries(fromJSONString: sanitizedBuildSettings)
         logger.log("Parsed \(entries.count) build settings entries")
-        if let projectHash {
-            entries = addingProjectHash(projectHash, to: entries)
+        let hashURL = outputDirectory.appendingPathComponent(hashFileName)
+        if projectHash != nil {
+            // Gone before the old files are touched and back only after the
+            // new ones are complete, so an interrupted write is dumped again.
+            if fileManager.fileExists(atPath: hashURL.path) {
+                try fileManager.removeItem(at: hashURL)
+            }
             let removed = try removeDumps(in: outputDirectory, fileManager: fileManager)
             logger.log("Removed \(removed) old per-target JSON files")
         }
         try writePerTargetFiles(entries: entries, to: outputDirectory, fileManager: fileManager)
         logger.log("Wrote \(targetBuckets(entries: entries).count) per-target JSON files")
+        if let projectHash {
+            try Data("\(projectHash)\n".utf8).write(to: hashURL, options: .atomic)
+            logger.log("Wrote \(hashURL.path)")
+        }
     }
 
     /// The .xcodeproj at `path`, or the only one in the working directory.
@@ -401,9 +416,16 @@ enum BuildSettingsTool {
         return output.joined(separator: "\n")
     }
 
-    /// Whether the output directory holds per-target files and every entry
-    /// in them carries `projectHash`.
+    /// Whether the output directory's hash file holds `projectHash` and the
+    /// directory holds per-target files, none of them from 1.0.5.
     static func dumpsMatch(projectHash: String, in directory: URL, fileManager: FileManager = .default) throws -> Bool {
+        let hashURL = directory.appendingPathComponent(hashFileName)
+        guard
+            let stored = try? String(contentsOf: hashURL, encoding: .utf8),
+            stored.trimmingCharacters(in: .whitespacesAndNewlines) == projectHash
+        else {
+            return false
+        }
         let dumps = try dumpFiles(in: directory, fileManager: fileManager)
         guard !dumps.isEmpty else { return false }
         return dumps.allSatisfy { url in
@@ -415,18 +437,8 @@ enum BuildSettingsTool {
                 return false
             }
             return entries.allSatisfy { entry in
-                (entry["buildSettings"] as? [String: Any])?[projectHashKey] as? String == projectHash
+                (entry["buildSettings"] as? [String: Any])?[legacyProjectHashKey] == nil
             }
-        }
-    }
-
-    static func addingProjectHash(_ projectHash: String, to entries: [[String: Any]]) -> [[String: Any]] {
-        entries.map { entry in
-            guard var buildSettings = entry["buildSettings"] as? [String: Any] else { return entry }
-            buildSettings[projectHashKey] = projectHash
-            var entry = entry
-            entry["buildSettings"] = buildSettings
-            return entry
         }
     }
 

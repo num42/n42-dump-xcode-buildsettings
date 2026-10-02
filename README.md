@@ -89,18 +89,25 @@ replaced, the redacted keys lose their values (XcodeGen writes the build number 
 into the project), and XcodeGen's random `TEMP_<UUID>` object ids and the object order that follows
 from them are normalised.
 
-The hash is stored as `N42_PROJECT_HASH` in the `buildSettings` of every entry in the per-target
-files. On the next run:
+The hash is stored as a single line in `hash.txt` next to the per-target files, so a change of the
+hash changes that one file plus the per-target files whose settings really changed. On the next run:
 
-- If every `*.json` in the output directory carries the current hash, the tool prints that the build
-  settings are unchanged and exits 0 without running `xcodebuild -showBuildSettings`.
-- Otherwise it dumps, deletes the old `*.json` in the output directory (so files of deleted targets
-  go away), and writes the new files with the hash.
+- If `hash.txt` holds the current hash and the output directory holds per-target `*.json` files,
+  the tool prints that the build settings are unchanged and exits 0 without running
+  `xcodebuild -showBuildSettings`.
+- Otherwise it dumps, deletes `hash.txt` and the old `*.json` in the output directory (so files of
+  deleted targets go away), writes the new files and writes `hash.txt` last. A dump that fails
+  leaves the old files and the old `hash.txt` alone, and a write that is cut short leaves no
+  `hash.txt`, so the next run dumps again.
+
+Version 1.0.5 stored the hash as `N42_PROJECT_HASH` in every entry's `buildSettings`. Files that
+still carry that key are dumped once more, and the new files no longer have it.
 
 The tool hashes the only `.xcodeproj` in the working directory. If there is none or more than one,
 name it with `--project <path>`; xcodebuild then dumps that project too.
 
-Without `--skip-if-unchanged` nothing is hashed and the output is the same as before.
+Without `--skip-if-unchanged` nothing is hashed, no `hash.txt` is written and the output is the same as
+before.
 
 ## Usage
 
