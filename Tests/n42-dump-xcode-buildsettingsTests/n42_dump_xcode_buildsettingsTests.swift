@@ -347,7 +347,7 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
         XCTAssertNotEqual(sanitized(generated), sanitized(generated.replacingOccurrences(of: "productName = Changeable", with: "productName = Other")))
     }
 
-    func testRunSkipsTheDumpWhenEveryFileCarriesTheProjectHash() throws {
+    func testRunSkipsTheDumpWhileTheHashFileMatches() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let project = try makeProject(in: root.appendingPathComponent("iOS"), build: "1", commit: "AAAA")
@@ -357,8 +357,10 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
 
         try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
         XCTAssertEqual(xcrun.dumps, 1)
-        let hash = try XCTUnwrap(projectHash(in: output.appendingPathComponent("App.json")))
-        XCTAssertEqual(try projectHash(in: output.appendingPathComponent("Widget.json")), hash)
+        let hashFile = try String(contentsOf: output.appendingPathComponent("hash.txt"), encoding: .utf8)
+        XCTAssertNotNil(hashFile.range(of: "^[0-9a-f]{64}\n$", options: .regularExpression), "one line with the hash")
+        XCTAssertFalse(try containsLegacyHash(output.appendingPathComponent("App.json")))
+        XCTAssertFalse(try containsLegacyHash(output.appendingPathComponent("Widget.json")))
         let written = try Data(contentsOf: output.appendingPathComponent("App.json"))
 
         // A new build number and commit only change redacted values.
@@ -366,46 +368,107 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
         try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
         XCTAssertEqual(xcrun.dumps, 1, "xcodebuild -showBuildSettings ran although nothing changed")
         XCTAssertEqual(try Data(contentsOf: output.appendingPathComponent("App.json")), written)
+        XCTAssertEqual(try storedHash(in: output), hashFile)
     }
 
-    func testRunDumpsAgainWhenAHashIsMissingOrDifferent() throws {
+    func testRunDumpsAgainWhenTheHashFileIsMissingOrDifferent() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = try makeProject(in: root.appendingPathComponent("iOS"), build: "1", commit: "AAAA")
+        let output = root.appendingPathComponent("iOS/PersistedLogs/buildConfigs")
+        let hashURL = output.appendingPathComponent("hash.txt")
+        let xcrun = FakeXcrun(targets: ["App", "Widget"])
+        let options = try skipOptions(project: project, output: output)
+
+        try BuildSettingsTool.run(options: try BuildSettingsTool.parseOptions(arguments: [
+            "--all-targets-output", output.appendingPathComponent("allTargets.json").path
+        ]), xcrun: xcrun.run)
+        XCTAssertEqual(xcrun.versionQueries, 0, "without --skip-if-unchanged nothing is hashed")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: hashURL.path), "without --skip-if-unchanged no hash file")
+        XCTAssertFalse(try containsLegacyHash(output.appendingPathComponent("App.json")))
+
+        try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
+        XCTAssertEqual(xcrun.dumps, 2, "no hash file yet")
+        let firstHash = try storedHash(in: output)
+
+        try writeFile(hashURL, "0123\n")
+        try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
+        XCTAssertEqual(xcrun.dumps, 3, "the hash file holds another hash")
+        XCTAssertEqual(try storedHash(in: output), firstHash)
+
+        try FileManager.default.removeItem(at: hashURL)
+        try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
+        XCTAssertEqual(xcrun.dumps, 4, "the hash file is gone")
+        XCTAssertEqual(try storedHash(in: output), firstHash)
+
+        _ = try BuildSettingsTool.removeDumps(in: output)
+        try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
+        XCTAssertEqual(xcrun.dumps, 5, "the hash file matches, but the per-target files are gone")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.appendingPathComponent("App.json").path))
+
+        xcrun.xcodeVersion = "Xcode 27.1\nBuild version 27B50"
+        try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
+        XCTAssertEqual(xcrun.dumps, 6, "another Xcode")
+        XCTAssertNotEqual(try storedHash(in: output), firstHash)
+    }
+
+    func testRunDumpsOnceMoreOverFilesThatCarryTheHashOf105() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let project = try makeProject(in: root.appendingPathComponent("iOS"), build: "1", commit: "AAAA")
         let output = root.appendingPathComponent("iOS/PersistedLogs/buildConfigs")
         let xcrun = FakeXcrun(targets: ["App", "Widget"])
         let options = try skipOptions(project: project, output: output)
+        try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
+        let hash = try storedHash(in: output)
+        let clean = try Data(contentsOf: output.appendingPathComponent("Widget.json"))
 
-        // Files from a release without the hash.
-        try BuildSettingsTool.run(options: try BuildSettingsTool.parseOptions(arguments: [
-            "--all-targets-output", output.appendingPathComponent("allTargets.json").path
-        ]), xcrun: xcrun.run)
-        XCTAssertNil(try projectHash(in: output.appendingPathComponent("App.json")))
-        XCTAssertEqual(xcrun.versionQueries, 0, "without --skip-if-unchanged nothing is hashed")
-
+        // Even with a matching hash file next to it.
+        try writeFile(
+            output.appendingPathComponent("Widget.json"),
+            #"[{"buildSettings":{"N42_PROJECT_HASH":"61314eb1","TARGET_NAME":"Widget"}}]"#
+        )
         try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
         XCTAssertEqual(xcrun.dumps, 2)
-        let firstHash = try XCTUnwrap(projectHash(in: output.appendingPathComponent("App.json")))
+        XCTAssertEqual(try Data(contentsOf: output.appendingPathComponent("Widget.json")), clean)
+        XCTAssertEqual(try storedHash(in: output), hash)
 
-        // One file without the hash is enough to dump again.
-        try writeFile(output.appendingPathComponent("Widget.json"), #"[{"buildSettings":{"TARGET_NAME":"Widget"}}]"#)
         try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
-        XCTAssertEqual(xcrun.dumps, 3)
-        XCTAssertEqual(try projectHash(in: output.appendingPathComponent("Widget.json")), firstHash)
-
-        xcrun.xcodeVersion = "Xcode 27.1\nBuild version 27B50"
-        try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
-        XCTAssertEqual(xcrun.dumps, 4)
-        XCTAssertNotEqual(try projectHash(in: output.appendingPathComponent("App.json")), firstHash)
+        XCTAssertEqual(xcrun.dumps, 2, "the clean files are skipped")
     }
 
-    func testRunRemovesTheFilesOfDeletedTargets() throws {
+    func testAFailedDumpKeepsTheOldHashFileAndFiles() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = try makeProject(in: root.appendingPathComponent("iOS"), build: "1", commit: "AAAA")
+        let output = root.appendingPathComponent("iOS/PersistedLogs/buildConfigs")
+        let xcrun = FakeXcrun(targets: ["App", "Widget"])
+        let options = try skipOptions(project: project, output: output)
+        try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
+        let oldHash = try storedHash(in: output)
+        let oldApp = try Data(contentsOf: output.appendingPathComponent("App.json"))
+
+        xcrun.xcodeVersion = "Xcode 27.1\nBuild version 27B50"
+        xcrun.failsDump = true
+        XCTAssertThrowsError(try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run))
+        XCTAssertEqual(try storedHash(in: output), oldHash)
+        XCTAssertEqual(try Data(contentsOf: output.appendingPathComponent("App.json")), oldApp)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.appendingPathComponent("Widget.json").path))
+
+        xcrun.failsDump = false
+        try BuildSettingsTool.run(options: options, homeDirectory: root.path, xcrun: xcrun.run)
+        XCTAssertEqual(xcrun.dumps, 3, "the old hash does not match, so the next run dumps")
+        XCTAssertNotEqual(try storedHash(in: output), oldHash)
+    }
+
+    func testRunRemovesTheFilesOfDeletedTargetsButNotTheHashFile() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let project = try makeProject(in: root.appendingPathComponent("iOS"), build: "1", commit: "AAAA")
         let output = root.appendingPathComponent("iOS/PersistedLogs/buildConfigs")
         try writeFile(output.appendingPathComponent("Removed.json"), #"[{"buildSettings":{"TARGET_NAME":"Removed"}}]"#)
         try writeFile(output.appendingPathComponent("README.txt"), "kept")
+        try writeFile(output.appendingPathComponent("hash.txt"), "0123\n")
 
         try BuildSettingsTool.run(
             options: try skipOptions(project: project, output: output),
@@ -415,8 +478,9 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
 
         XCTAssertEqual(
             try FileManager.default.contentsOfDirectory(atPath: output.path).sorted(),
-            ["App.json", "README.txt"]
+            ["App.json", "README.txt", "hash.txt"]
         )
+        XCTAssertNotEqual(try storedHash(in: output), "0123\n")
     }
 
     func testLocateProjectNeedsExactlyOneProjectWithoutTheOption() throws {
@@ -442,6 +506,7 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
     private final class FakeXcrun {
         let targets: [String]
         var xcodeVersion = "Xcode 27.0\nBuild version 27A100"
+        var failsDump = false
         private(set) var dumps = 0
         private(set) var versionQueries = 0
 
@@ -456,6 +521,9 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
             }
             XCTAssertTrue(arguments.contains("-showBuildSettings"), "unexpected call \(arguments)")
             dumps += 1
+            if failsDump {
+                throw CLIError.commandFailed("xcodebuild: error: Could not resolve package dependencies")
+            }
             let entries = targets.map { #"{"action":"build","target":"\#($0)","buildSettings":{"TARGET_NAME":"\#($0)","PATH":"/usr/bin"}}"# }
             return "[" + entries.joined(separator: ",") + "]"
         }
@@ -494,9 +562,14 @@ final class n42_dump_xcode_buildsettingsTests: XCTestCase {
         return project
     }
 
-    private func projectHash(in file: URL) throws -> String? {
+    private func storedHash(in output: URL) throws -> String {
+        try String(contentsOf: output.appendingPathComponent("hash.txt"), encoding: .utf8)
+    }
+
+    private func containsLegacyHash(_ file: URL) throws -> Bool {
         let entries = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [[String: Any]])
-        return (entries.first?["buildSettings"] as? [String: Any])?[BuildSettingsTool.projectHashKey] as? String
+        XCTAssertFalse(entries.isEmpty)
+        return entries.contains { ($0["buildSettings"] as? [String: Any])?[BuildSettingsTool.legacyProjectHashKey] != nil }
     }
 
     private func makeTemporaryDirectory() throws -> URL {
